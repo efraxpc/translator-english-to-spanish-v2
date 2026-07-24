@@ -1,0 +1,21 @@
+[project]
+name = "pdf-translator"
+version = "0.1.0"
+description = "Traduce PDFs técnicos de inglés a español con la API de Gemini, conservando el layout original y los bloques de código intactos."
+requires-python = ">=3.10"
+dependencies = [
+    "google-genai>=1.0.0",
+    "pymupdf>=1.25.0",
+    "pydantic>=2.0",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+pdf-translator = "pdf_translator.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

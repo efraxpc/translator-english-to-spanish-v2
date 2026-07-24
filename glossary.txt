@@ -1,0 +1,118 @@
+# Términos que SIEMPRE se conservan en inglés (uno por línea).
+# Las líneas que empiezan con # se ignoran. Agrega los tuyos libremente.
+
+# IA / Machine Learning
+embedding
+embeddings
+transformer
+attention
+fine-tuning
+prompt
+prompt engineering
+token
+tokenizer
+pipeline
+dataset
+batch
+epoch
+learning rate
+overfitting
+underfitting
+dropout
+gradient descent
+backpropagation
+feature engineering
+feature store
+inference
+serving
+checkpoint
+RAG
+retrieval augmented generation
+agent
+tool calling
+function calling
+grounding
+context window
+chain of thought
+few-shot
+zero-shot
+benchmark
+ground truth
+recall
+precision
+drift
+data drift
+model drift
+
+# Ingeniería de software
+deployment
+deploy
+build
+release
+rollback
+endpoint
+API
+SDK
+CLI
+framework
+runtime
+backend
+frontend
+middleware
+microservices
+container
+pod
+cluster
+namespace
+CI/CD
+commit
+branch
+merge
+pull request
+refactoring
+testing
+unit test
+logging
+monitoring
+observability
+tracing
+caching
+queue
+stream
+streaming
+webhook
+payload
+schema
+throughput
+latency
+
+# GCP (productos y conceptos)
+Google Cloud
+Cloud Run
+Cloud Functions
+Cloud Storage
+BigQuery
+Vertex AI
+Pub/Sub
+Dataflow
+Dataproc
+Cloud SQL
+Spanner
+Firestore
+Bigtable
+GKE
+Kubernetes
+Compute Engine
+App Engine
+Cloud Build
+Artifact Registry
+Cloud Logging
+Cloud Monitoring
+IAM
+service account
+bucket
+project
+region
+zone
+VPC
+load balancer
