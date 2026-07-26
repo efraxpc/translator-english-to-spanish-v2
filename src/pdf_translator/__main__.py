@@ -47,7 +47,9 @@ def translate_pdf(
         f"({len(translatable)} a traducir, {code_blocks} de código conservados)"
     )
 
-    checkpoint = Checkpoint(pdf_path, translator.model, workdir)
+    # El cache distingue el modo parafraseo para no mezclar ambos estilos.
+    cache_model = translator.model + ("-parafraseo" if translator.parafrasear else "")
+    checkpoint = Checkpoint(pdf_path, cache_model, workdir)
 
     # Páginas sin texto extraíble (texto vectorizado/escaneado) → OCR con Gemini.
     pages_with_text = {b.page for b in blocks}
@@ -61,7 +63,10 @@ def translate_pdf(
             f"  {len(ocr_pages)} páginas sin texto extraíble: "
             "usando OCR con Gemini (texto vectorizado o escaneado)"
         )
-        ocr = GeminiOcr(translator.client, translator.model, translator.glossary)
+        ocr = GeminiOcr(
+            translator.client, translator.model, translator.glossary,
+            parafrasear=translator.parafrasear,
+        )
         for n, page_index in enumerate(ocr_pages, 1):
             key = f"ocr_p{page_index + 1:04d}"
             cached = checkpoint.load(key)
@@ -157,6 +162,11 @@ def main() -> None:
         "--glossary", type=Path, default=None,
         help="Archivo de glosario con términos a conservar en inglés",
     )
+    parser.add_argument(
+        "--parafrasear", action="store_true",
+        help="Parafrasea los párrafos en español claro y sencillo en vez de "
+        "traducirlos literalmente (títulos y viñetas se traducen directos)",
+    )
     args = parser.parse_args()
 
     if args.input.is_dir():
@@ -172,10 +182,13 @@ def main() -> None:
         sys.exit(f"No existe: {args.input}")
 
     glossary = load_glossary(args.glossary)
-    translator = GeminiTranslator(model=args.model, glossary=glossary)
+    translator = GeminiTranslator(
+        model=args.model, glossary=glossary, parafrasear=args.parafrasear
+    )
 
     for pdf_path, output_path in targets:
-        print(f"Traduciendo {pdf_path.name} [{args.model}]")
+        modo = " [parafraseo]" if args.parafrasear else ""
+        print(f"Traduciendo {pdf_path.name} [{args.model}]{modo}")
         translate_pdf(
             pdf_path, output_path, translator, args.pages_per_batch, args.workdir
         )

@@ -18,12 +18,27 @@ class TranslatedBlock(BaseModel):
     translated: str
 
 
-def build_system_prompt(glossary: list[str]) -> str:
+def build_system_prompt(glossary: list[str], parafrasear: bool = False) -> str:
     glossary_section = ""
     if glossary:
         glossary_section = (
             "\n\nGlosario de términos que SIEMPRE se conservan en inglés "
             "(además de las reglas anteriores):\n" + ", ".join(glossary)
+        )
+    paraphrase_section = ""
+    if parafrasear:
+        paraphrase_section = (
+            "\n\nModo parafraseo (prioridad sobre la traducción literal):\n"
+            "- Los párrafos completos NO se traducen literalmente: reescribe "
+            "su contenido en un español claro y sencillo, explicando la idea "
+            "con palabras más simples para que cualquier lector lo entienda "
+            "fácilmente, sin perder precisión técnica.\n"
+            "- Usa una extensión similar o menor que el original: el texto "
+            "debe caber en el mismo espacio del PDF.\n"
+            "- Títulos, viñetas, etiquetas cortas y pies de figura se traducen "
+            "de forma directa, sin parafrasear.\n"
+            "- El resto de reglas (términos técnicos en inglés, código "
+            "intacto, puntuación estructural, glosario) sigue aplicando."
         )
     return (
         "Eres un traductor técnico profesional de inglés a español "
@@ -49,15 +64,22 @@ def build_system_prompt(glossary: list[str]) -> str:
         "un número o un nombre propio), devuélvelo sin cambios.\n"
         "5. No agregues comentarios ni explicaciones: solo la traducción."
         + glossary_section
+        + paraphrase_section
     )
 
 
 class GeminiTranslator:
-    def __init__(self, model: str, glossary: list[str] | None = None):
+    def __init__(
+        self,
+        model: str,
+        glossary: list[str] | None = None,
+        parafrasear: bool = False,
+    ):
         self.client = genai.Client()
         self.model = model
         self.glossary = glossary or []
-        self.system_prompt = build_system_prompt(self.glossary)
+        self.parafrasear = parafrasear
+        self.system_prompt = build_system_prompt(self.glossary, parafrasear)
 
     def translate_batch(self, blocks: list[Block]) -> dict[str, str]:
         """Traduce un lote de bloques. Devuelve {id: texto_traducido}."""

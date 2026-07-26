@@ -30,12 +30,27 @@ class OcrBlock(BaseModel):
     bold: bool
 
 
-def build_ocr_prompt(glossary: list[str]) -> str:
+def build_ocr_prompt(glossary: list[str], parafrasear: bool = False) -> str:
     glossary_section = ""
     if glossary:
         glossary_section = (
             "\n\nGlosario de términos que SIEMPRE se conservan en inglés "
             "(además de las reglas anteriores):\n" + ", ".join(glossary)
+        )
+    paraphrase_section = ""
+    if parafrasear:
+        paraphrase_section = (
+            "\n\nModo parafraseo (prioridad sobre la traducción literal):\n"
+            "- Los párrafos completos NO se traducen literalmente: reescribe "
+            "su contenido en un español claro y sencillo, explicando la idea "
+            "con palabras más simples para que cualquier lector lo entienda "
+            "fácilmente, sin perder precisión técnica.\n"
+            "- Usa una extensión similar o menor que el original: el texto "
+            "debe caber en el mismo espacio del PDF.\n"
+            "- Títulos, viñetas, etiquetas cortas y pies de figura se traducen "
+            "de forma directa, sin parafrasear.\n"
+            "- El resto de reglas (términos técnicos en inglés, código "
+            "intacto, puntuación estructural, glosario) sigue aplicando."
         )
     return (
         "La imagen es una página de un libro técnico en inglés sobre IA, "
@@ -67,14 +82,21 @@ def build_ocr_prompt(glossary: list[str]) -> str:
         "términos del glosario.\n"
         "6. No agregues comentarios: solo los bloques detectados."
         + glossary_section
+        + paraphrase_section
     )
 
 
 class GeminiOcr:
-    def __init__(self, client: genai.Client, model: str, glossary: list[str] | None = None):
+    def __init__(
+        self,
+        client: genai.Client,
+        model: str,
+        glossary: list[str] | None = None,
+        parafrasear: bool = False,
+    ):
         self.client = client
         self.model = model
-        self.prompt = build_ocr_prompt(glossary or [])
+        self.prompt = build_ocr_prompt(glossary or [], parafrasear)
 
     def ocr_page(self, page: pymupdf.Page, page_index: int) -> list[Block]:
         """Renderiza la página, la manda a Gemini y devuelve bloques traducidos."""
