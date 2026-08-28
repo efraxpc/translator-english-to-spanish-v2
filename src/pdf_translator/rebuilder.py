@@ -56,12 +56,18 @@ def rebuild(doc: pymupdf.Document, blocks: list[Block]) -> None:
             )
 
         for block in page_blocks:
-            rect = pymupdf.Rect(block.bbox)
+            source_rect = pymupdf.Rect(block.bbox)
             if block.from_ocr:
                 # El texto original es vectorial (curvas): no se puede redactar
                 # sin arrastrar los gráficos, así que se tapa con un rectángulo
                 # (con margen, porque el bbox del OCR no es exacto al píxel).
-                cover = (rect + (-3, -3, 3, 3)) & page.rect
+                margin = 1 if block.is_table_cell else 3
+                cover = (
+                    source_rect + (-margin, -margin, margin, margin)
+                ) & page.rect
                 page.draw_rect(cover, color=None, fill=(1, 1, 1))
+            layout_rect = pymupdf.Rect(block.layout_bbox or block.bbox)
             # scale_low=0 permite reducir la fuente lo necesario para caber.
-            page.insert_htmlbox(rect, _block_html(block), css=_BASE_CSS, scale_low=0)
+            page.insert_htmlbox(
+                layout_rect, _block_html(block), css=_BASE_CSS, scale_low=0
+            )

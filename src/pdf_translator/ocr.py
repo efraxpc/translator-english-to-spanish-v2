@@ -20,6 +20,7 @@ from .extractor import Block
 _ZOOM = 2.0  # resolución del render enviado a Gemini
 _MAX_RETRIES = 5
 _RETRYABLE_CODES = {429, 500, 502, 503, 504}
+_MIN_REGION_HEIGHT = 62  # coordenadas normalizadas; hasta 16 franjas por página
 
 
 class OcrBlock(BaseModel):
@@ -28,6 +29,12 @@ class OcrBlock(BaseModel):
     is_code: bool
     line_count: int
     bold: bool
+    is_table_cell: bool = False
+    cell_box_2d: list[int] | None = None
+
+
+class EmptyOcrResponse(ValueError):
+    """Gemini terminó la llamada sin devolver ningún bloque de texto."""
 
 
 def build_ocr_prompt(glossary: list[str], parafrasear: bool = False) -> str:
@@ -59,13 +66,17 @@ def build_ocr_prompt(glossary: list[str], parafrasear: bool = False) -> str:
         "viñetas, pies de figura, cabeceras, números de página...). Para cada "
         "bloque devuelve:\n"
         "- box_2d: [ymin, xmin, ymax, xmax] normalizado a 0-1000, ajustado al "
-        "bloque completo.\n"
+        "texto visible del bloque.\n"
         "- text: la traducción del bloque a español neutro y profesional. Si "
         "el bloque es código, devuelve el texto original sin cambios.\n"
         "- is_code: true si el bloque es un listado de código, comando de "
         "terminal o salida de consola.\n"
         "- line_count: número de líneas de texto del bloque original.\n"
-        "- bold: true si el bloque está mayoritariamente en negrita.\n\n"
+        "- bold: true si el bloque está mayoritariamente en negrita.\n"
+        "- is_table_cell: true si el bloque pertenece a una celda de una "
+        "tabla con filas y columnas visibles.\n"
+        "- cell_box_2d: para una celda, los límites completos de esa celda "
+        "normalizados a 0-1000; usa null para los demás bloques.\n\n"
         "Reglas de traducción estrictas:\n"
         "1. CONSERVA EN INGLÉS los términos técnicos de IA/ML/software/GCP: "
         "nombres de productos (Cloud Run, BigQuery, Vertex AI...), conceptos "
@@ -80,7 +91,17 @@ def build_ocr_prompt(glossary: list[str], parafrasear: bool = False) -> str:
         "(YES → SÍ, NO → NO) y los pies de figura (Figure 1.1: → Figura 1.1:). "
         "Ningún texto en inglés debe quedar sin traducir salvo código y "
         "términos del glosario.\n"
-        "6. No agregues comentarios: solo los bloques detectados."
+        "6. Si un párrafo empieza o termina a media oración porque continúa "
+        "en la página anterior o siguiente, NO lo completes: parafrasea o "
+        "traduce solo el fragmento y déjalo igual de incompleto que el "
+        "original (sin cerrar la oración ni inventar un comienzo), para que "
+        "encaje con su continuación.\n"
+        "7. En tablas con bordes, devuelve cada celda no vacía como un "
+        "bloque independiente. Conserva las celdas combinadas mediante su "
+        "cell_box_2d y nunca fusiones, dividas o reordenes su contenido ni "
+        "generes sintaxis de tabla Markdown. Ajusta box_2d solo al texto para "
+        "que la cuadrícula original no se cubra.\n"
+        "8. No agregues comentarios: solo los bloques detectados."
         + glossary_section
         + paraphrase_section
     )
@@ -102,22 +123,33 @@ class GeminiOcr:
         """Renderiza la página, la manda a Gemini y devuelve bloques traducidos."""
         pix = page.get_pixmap(matrix=pymupdf.Matrix(_ZOOM, _ZOOM))
         png = pix.tobytes("png")
-        items = self._call_with_retries(png)
+        try:
+            items = self._call_with_retries(png)
+        except EmptyOcrResponse as exc:
+            print(
+                "    Gemini no devolvió texto para la página completa "
+                f"({exc}); procesando recortes reales..."
+            )
+            # RECITATION depende del contenido visible: limitar la salida solo
+            # mediante el prompt no basta. Se envían cuatro recortes físicos.
+            parts = 4 if "RECITATION" in str(exc) else 2
+            items = self._call_by_regions(page, 0, 1000, parts)
 
         width, height = page.rect.width, page.rect.height
         blocks: list[Block] = []
         for i, item in enumerate(items):
-            if len(item.box_2d) != 4 or not item.text.strip():
+            bbox = _box_to_page(item.box_2d, width, height)
+            if bbox is None or not item.text.strip():
                 continue
-            ymin, xmin, ymax, xmax = (max(0, min(1000, v)) for v in item.box_2d)
-            if ymax <= ymin or xmax <= xmin:
-                continue
-            bbox = (
-                xmin / 1000 * width,
-                ymin / 1000 * height,
-                xmax / 1000 * width,
-                ymax / 1000 * height,
-            )
+            layout_bbox = None
+            if item.is_table_cell and item.cell_box_2d is not None:
+                cell_bbox = _box_to_page(item.cell_box_2d, width, height)
+                if cell_bbox is not None:
+                    cell_rect = pymupdf.Rect(cell_bbox)
+                    if cell_rect.contains(pymupdf.Rect(bbox)):
+                        if cell_rect.width > 4 and cell_rect.height > 4:
+                            cell_rect += (2, 2, -2, -2)
+                        layout_bbox = tuple(cell_rect)
             lines = max(item.line_count, 1)
             font_size = min(max((bbox[3] - bbox[1]) / lines / 1.3, 6.0), 40.0)
             blocks.append(
@@ -133,30 +165,103 @@ class GeminiOcr:
                     translatable=not item.is_code,
                     translated=None if item.is_code else item.text,
                     from_ocr=True,
+                    is_table_cell=item.is_table_cell,
+                    layout_bbox=layout_bbox,
                 )
             )
         return blocks
 
-    def _call_with_retries(self, png: bytes) -> list[OcrBlock]:
+    def _call_by_regions(
+        self,
+        page: pymupdf.Page,
+        ymin: int,
+        ymax: int,
+        parts: int = 2,
+    ) -> list[OcrBlock]:
+        """Renderiza franjas reales y remapea sus coordenadas a la página."""
+        items: list[OcrBlock] = []
+        boundaries = [
+            ymin + round((ymax - ymin) * index / parts)
+            for index in range(parts + 1)
+        ]
+        for start, end in zip(boundaries, boundaries[1:]):
+            png = self._render_region(page, start, end)
+            try:
+                region_items = self._call_with_retries(png, is_crop=True)
+            except EmptyOcrResponse as exc:
+                if end - start <= _MIN_REGION_HEIGHT:
+                    raise EmptyOcrResponse(
+                        f"recorte {start}-{end}: {exc}"
+                    ) from exc
+                print(
+                    f"    Recorte {start}-{end} sin respuesta ({exc}); "
+                    "subdividiendo..."
+                )
+                items.extend(self._call_by_regions(page, start, end))
+                continue
+            items.extend(_remap_region_items(region_items, start, end))
+        return items
+
+    @staticmethod
+    def _render_region(page: pymupdf.Page, ymin: int, ymax: int) -> bytes:
+        """Renderiza un intervalo vertical normalizado de la página."""
+        rect = page.rect
+        clip = pymupdf.Rect(
+            rect.x0,
+            rect.y0 + ymin / 1000 * rect.height,
+            rect.x1,
+            rect.y0 + ymax / 1000 * rect.height,
+        )
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(_ZOOM, _ZOOM), clip=clip)
+        return pix.tobytes("png")
+
+    def _call_with_retries(
+        self,
+        png: bytes,
+        is_crop: bool = False,
+    ) -> list[OcrBlock]:
         delay = 5.0
         for attempt in range(1, _MAX_RETRIES + 1):
             try:
+                contents = [
+                    types.Part.from_bytes(data=png, mime_type="image/png"),
+                    self.prompt,
+                ]
+                if is_crop:
+                    contents.append(
+                        "La imagen es un recorte horizontal de una página. "
+                        "Procesa únicamente el texto visible, sin reconstruir "
+                        "contenido fuera del recorte. Normaliza box_2d y "
+                        "cell_box_2d de 0 a 1000 respecto de ESTE RECORTE."
+                    )
                 response = self.client.models.generate_content(
                     model=self.model,
-                    contents=[
-                        types.Part.from_bytes(data=png, mime_type="image/png"),
-                        self.prompt,
-                    ],
+                    contents=contents,
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
                         response_schema=list[OcrBlock],
                         temperature=0.1,
+                        thinking_config=(
+                            types.ThinkingConfig(thinking_level="low")
+                            if self.model.startswith("gemini-3")
+                            else None
+                        ),
                     ),
                 )
                 parsed = response.parsed
                 if parsed is None:
-                    raise ValueError(f"Respuesta sin JSON parseable: {response.text!r:.200}")
+                    detail = _describe_empty_response(response)
+                    if response.text is None:
+                        raise EmptyOcrResponse(detail)
+                    raise ValueError(
+                        f"Respuesta sin JSON parseable ({detail}): "
+                        f"{response.text!r:.200}"
+                    )
                 return parsed
+            except EmptyOcrResponse:
+                # Repetir la misma imagen no corrige bloqueos ni respuestas
+                # vacías deterministas; el caller la divide en regiones.
+                raise
             except (errors.APIError, ValueError) as exc:
                 code = getattr(exc, "code", None)
                 retryable = code in _RETRYABLE_CODES or isinstance(exc, ValueError)
@@ -170,6 +275,83 @@ class GeminiOcr:
                     continue
                 raise
         raise RuntimeError("unreachable")
+
+
+def _remap_region_items(
+    items: list[OcrBlock], ymin: int, ymax: int
+) -> list[OcrBlock]:
+    """Convierte box_2d normalizados en un recorte a coordenadas de página."""
+    height = ymax - ymin
+    remapped: list[OcrBlock] = []
+    for item in items:
+        updates = {"box_2d": _remap_region_box(item.box_2d, ymin, height)}
+        if item.cell_box_2d is not None:
+            updates["cell_box_2d"] = _remap_region_box(
+                item.cell_box_2d, ymin, height
+            )
+        remapped.append(item.model_copy(update=updates))
+    return remapped
+
+
+def _remap_region_box(box: list[int], ymin: int, height: int) -> list[int]:
+    """Remapea una caja del recorte al sistema normalizado de la página."""
+    if len(box) != 4:
+        return box
+    local_ymin, xmin, local_ymax, xmax = box
+    return [
+        round(ymin + local_ymin / 1000 * height),
+        xmin,
+        round(ymin + local_ymax / 1000 * height),
+        xmax,
+    ]
+
+
+def _box_to_page(
+    box: list[int], width: float, height: float
+) -> tuple[float, float, float, float] | None:
+    """Convierte y valida una caja normalizada a coordenadas del PDF."""
+    if len(box) != 4:
+        return None
+    ymin, xmin, ymax, xmax = (max(0, min(1000, value)) for value in box)
+    if ymax <= ymin or xmax <= xmin:
+        return None
+    return (
+        xmin / 1000 * width,
+        ymin / 1000 * height,
+        xmax / 1000 * width,
+        ymax / 1000 * height,
+    )
+
+
+def _describe_empty_response(response) -> str:
+    """Resume el motivo real de una respuesta vacía sin volcar datos sensibles."""
+    candidate = response.candidates[0] if response.candidates else None
+    reason = getattr(candidate, "finish_reason", None)
+    if hasattr(reason, "value"):
+        reason = reason.value
+    message = getattr(candidate, "finish_message", None)
+
+    feedback = response.prompt_feedback
+    block_reason = getattr(feedback, "block_reason", None)
+    if hasattr(block_reason, "value"):
+        block_reason = block_reason.value
+    block_message = getattr(feedback, "block_reason_message", None)
+
+    usage = response.usage_metadata
+    tokens = ""
+    if usage is not None:
+        tokens = (
+            ", tokens="
+            f"prompt:{getattr(usage, 'prompt_token_count', None)}/"
+            f"respuesta:{getattr(usage, 'candidates_token_count', None)}/"
+            f"pensamiento:{getattr(usage, 'thoughts_token_count', None)}/"
+            f"total:{getattr(usage, 'total_token_count', None)}"
+        )
+    return (
+        f"finish_reason={reason!r}, finish_message={message!r}, "
+        f"block_reason={block_reason!r}, block_message={block_message!r}"
+        f"{tokens}"
+    )
 
 
 # Palabras que casi nunca aparecen en español: si están, el bloque quedó en inglés.
@@ -198,6 +380,8 @@ def block_to_dict(block: Block) -> dict:
         "is_code": block.is_code,
         "translatable": block.translatable,
         "translated": block.translated,
+        "is_table_cell": block.is_table_cell,
+        "layout_bbox": list(block.layout_bbox) if block.layout_bbox else None,
     }
 
 
@@ -213,4 +397,63 @@ def block_from_dict(data: dict) -> Block:
         translatable=data["translatable"],
         translated=data["translated"],
         from_ocr=True,
+        is_table_cell=data.get("is_table_cell", False),
+        layout_bbox=(
+            tuple(data["layout_bbox"]) if data.get("layout_bbox") else None
+        ),
     )
+
+
+# --- Costura de oraciones que cruzan saltos de página ----------------------
+# Cada página se OCR-traduce por separado; una oración que cruza el salto se
+# traduce en dos mitades independientes que pueden no encajar (la cola queda
+# colgando y la cabeza reinicia la oración, sobre todo con --parafrasear).
+
+_TERMINAL_RE = re.compile(r"[.!?…:;»”\"')\]]\s*$")
+
+
+def _ends_mid_sentence(text: str) -> bool:
+    """Heurística: ¿este fragmento termina a media oración?"""
+    stripped = text.strip().strip("*_` ")
+    if not stripped:
+        return False
+    return not _TERMINAL_RE.search(stripped)
+
+
+def _starts_lowercase(text: str) -> bool:
+    """¿el primer carácter alfabético es minúscula?"""
+    for ch in text.strip():
+        if ch.isalpha():
+            return ch.islower()
+        if ch.isdigit():
+            return False
+    return False
+
+
+def find_broken_seams(blocks: list[Block]) -> list[tuple[Block, Block]]:
+    """Pares (fin de pág. N, inicio de pág. N+1) candidatos a estar mal cosidos.
+
+    Se marca el par si la cola termina a media oración (la cabeza debería
+    continuarla pero podría haberla reiniciado) o si la cabeza empieza en
+    minúscula pese a que la cola cierra con puntuación final (inversión
+    sospechosa). Son solo candidatos: el modelo confirma en el paso de
+    costura si la unión necesita reescritura.
+    """
+    by_page: dict[int, list[Block]] = {}
+    for b in blocks:
+        if (
+            b.from_ocr
+            and not b.is_table_cell
+            and b.translatable
+            and b.translated
+        ):
+            by_page.setdefault(b.page, []).append(b)
+    seams: list[tuple[Block, Block]] = []
+    for page in sorted(by_page):
+        if page + 1 not in by_page:
+            continue
+        tail = max(by_page[page], key=lambda b: b.bbox[1])
+        head = min(by_page[page + 1], key=lambda b: b.bbox[1])
+        if _ends_mid_sentence(tail.translated) or _starts_lowercase(head.translated):
+            seams.append((tail, head))
+    return seams
