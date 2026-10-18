@@ -8,17 +8,22 @@ from pathlib import Path
 import pymupdf
 
 from .checkpoint import Checkpoint
-from .config import DEFAULT_MODEL, DEFAULT_PAGES_PER_BATCH, load_glossary
+from .config import (
+    DEFAULT_MODEL,
+    DEFAULT_PAGES_PER_BATCH,
+    MissingApiKeyError,
+    load_glossary,
+)
 from .extractor import Block, extract_blocks
 from .ocr import (
-    GeminiOcr,
+    OpenAIOcr,
     block_from_dict,
     block_to_dict,
     find_broken_seams,
     looks_english,
 )
 from .rebuilder import rebuild
-from .translator import GeminiTranslator
+from .translator import OpenAITranslator
 
 PageRange = tuple[int, int]
 
@@ -80,7 +85,7 @@ def make_batches(blocks: list[Block], pages_per_batch: int) -> list[list[Block]]
 def translate_pdf(
     pdf_path: Path,
     output_path: Path,
-    translator: GeminiTranslator,
+    translator: OpenAITranslator,
     pages_per_batch: int,
     workdir: Path | None,
     page_range: PageRange | None = None,
@@ -119,7 +124,7 @@ def translate_pdf(
     cache_model = translator.model + ("-parafraseo" if translator.parafrasear else "")
     checkpoint = Checkpoint(pdf_path, cache_model, workdir)
 
-    # Páginas sin texto extraíble (texto vectorizado/escaneado) → OCR con Gemini.
+    # Páginas sin texto extraíble (texto vectorizado/escaneado) → OCR con OpenAI.
     pages_with_text = {b.page for b in blocks}
     ocr_pages = []
     for page_index in page_indexes:
@@ -132,9 +137,9 @@ def translate_pdf(
     if ocr_pages:
         print(
             f"  {len(ocr_pages)} páginas sin texto extraíble: "
-            "usando OCR con Gemini (texto vectorizado o escaneado)"
+            "usando OCR con OpenAI (texto vectorizado o escaneado)"
         )
-        ocr = GeminiOcr(
+        ocr = OpenAIOcr(
             translator.client, translator.model, translator.glossary,
             parafrasear=translator.parafrasear,
         )
@@ -226,7 +231,7 @@ def translate_pdf(
                         key, {"blocks": [block_to_dict(b) for b in page_blocks]}
                     )
 
-    # Los bloques OCR ya vienen traducidos; a Gemini solo van los normales.
+    # Los bloques OCR ya vienen traducidos; a OpenAI solo van los normales.
     batches = make_batches([b for b in blocks if not b.from_ocr], pages_per_batch)
     translations: dict[str, str] = {}
 
@@ -272,7 +277,7 @@ def translate_pdf(
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="pdf-translator",
-        description="Traduce PDFs técnicos de inglés a español con Gemini, "
+        description="Traduce PDFs técnicos de inglés a español con OpenAI, "
         "conservando el layout y los bloques de código intactos.",
     )
     parser.add_argument("input", type=Path, help="PDF o carpeta con PDFs")
@@ -284,7 +289,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--model", default=DEFAULT_MODEL,
-        help=f"Modelo Gemini (por defecto: {DEFAULT_MODEL})",
+        help=f"Modelo OpenAI (por defecto: {DEFAULT_MODEL})",
     )
     parser.add_argument(
         "--pages-per-batch", type=int, default=DEFAULT_PAGES_PER_BATCH,
@@ -375,9 +380,12 @@ def main() -> None:
         sys.exit(f"No existe: {args.input}")
 
     glossary = load_glossary(args.glossary)
-    translator = GeminiTranslator(
-        model=args.model, glossary=glossary, parafrasear=args.parafrasear
-    )
+    try:
+        translator = OpenAITranslator(
+            model=args.model, glossary=glossary, parafrasear=args.parafrasear
+        )
+    except MissingApiKeyError as exc:
+        sys.exit(f"Error de configuración: {exc}")
 
     for pdf_path, output_path, page_range in targets:
         modo = " [parafraseo]" if args.parafrasear else ""

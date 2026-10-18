@@ -1,23 +1,23 @@
-"""OCR con Gemini para páginas sin texto extraíble (texto convertido a curvas).
+"""OCR con OpenAI para páginas sin texto extraíble (texto convertido a curvas).
 
 Algunos PDFs no contienen texto real: los glifos están vectorizados como
 trazos, sin fuentes ni operadores de texto, y PyMuPDF no puede extraer nada.
-Para esas páginas se renderiza la página a imagen y se le pide a Gemini
+Para esas páginas se renderiza la página a imagen y se le pide a OpenAI
 (multimodal) que detecte los bloques de texto con sus coordenadas y los
 traduzca en una sola llamada.
 """
 
+import base64
 import re
 import time
 
 import pymupdf
-from google import genai
-from google.genai import errors, types
+from openai import OpenAI, OpenAIError
 from pydantic import BaseModel
 
 from .extractor import Block
 
-_ZOOM = 2.0  # resolución del render enviado a Gemini
+_ZOOM = 2.0  # resolución del render enviado a OpenAI
 _MAX_RETRIES = 5
 _RETRYABLE_CODES = {429, 500, 502, 503, 504}
 _MIN_REGION_HEIGHT = 62  # coordenadas normalizadas; hasta 16 franjas por página
@@ -33,8 +33,12 @@ class OcrBlock(BaseModel):
     cell_box_2d: list[int] | None = None
 
 
+class OcrPage(BaseModel):
+    blocks: list[OcrBlock]
+
+
 class EmptyOcrResponse(ValueError):
-    """Gemini terminó la llamada sin devolver ningún bloque de texto."""
+    """OpenAI terminó la llamada sin devolver ningún bloque de texto."""
 
 
 def build_ocr_prompt(glossary: list[str], parafrasear: bool = False) -> str:
@@ -74,7 +78,8 @@ def build_ocr_prompt(glossary: list[str], parafrasear: bool = False) -> str:
         "- line_count: número de líneas de texto del bloque original.\n"
         "- bold: true si el bloque está mayoritariamente en negrita.\n"
         "- is_table_cell: true si el bloque pertenece a una celda de una "
-        "tabla con filas y columnas visibles.\n"
+        "tabla con filas y columnas, aunque no tenga bordes, o a una "
+        "estructura de datos alineados en columnas.\n"
         "- cell_box_2d: para una celda, los límites completos de esa celda "
         "normalizados a 0-1000; usa null para los demás bloques.\n\n"
         "Reglas de traducción estrictas:\n"
@@ -96,7 +101,8 @@ def build_ocr_prompt(glossary: list[str], parafrasear: bool = False) -> str:
         "traduce solo el fragmento y déjalo igual de incompleto que el "
         "original (sin cerrar la oración ni inventar un comienzo), para que "
         "encaje con su continuación.\n"
-        "7. En tablas con bordes, devuelve cada celda no vacía como un "
+        "7. En tablas con o sin bordes y estructuras de datos en columnas, "
+        "devuelve cada celda no vacía como un "
         "bloque independiente. Conserva las celdas combinadas mediante su "
         "cell_box_2d y nunca fusiones, dividas o reordenes su contenido ni "
         "generes sintaxis de tabla Markdown. Ajusta box_2d solo al texto para "
@@ -107,10 +113,10 @@ def build_ocr_prompt(glossary: list[str], parafrasear: bool = False) -> str:
     )
 
 
-class GeminiOcr:
+class OpenAIOcr:
     def __init__(
         self,
-        client: genai.Client,
+        client: OpenAI,
         model: str,
         glossary: list[str] | None = None,
         parafrasear: bool = False,
@@ -120,19 +126,20 @@ class GeminiOcr:
         self.prompt = build_ocr_prompt(glossary or [], parafrasear)
 
     def ocr_page(self, page: pymupdf.Page, page_index: int) -> list[Block]:
-        """Renderiza la página, la manda a Gemini y devuelve bloques traducidos."""
+        """Renderiza la página, la manda a OpenAI y devuelve bloques traducidos."""
         pix = page.get_pixmap(matrix=pymupdf.Matrix(_ZOOM, _ZOOM))
         png = pix.tobytes("png")
         try:
             items = self._call_with_retries(png)
         except EmptyOcrResponse as exc:
             print(
-                "    Gemini no devolvió texto para la página completa "
+                "    OpenAI no devolvió texto para la página completa "
                 f"({exc}); procesando recortes reales..."
             )
-            # RECITATION depende del contenido visible: limitar la salida solo
-            # mediante el prompt no basta. Se envían cuatro recortes físicos.
-            parts = 4 if "RECITATION" in str(exc) else 2
+            # Un bloqueo de contenido puede depender de la cantidad de texto
+            # visible; los recortes físicos reducen el contexto de cada llamada.
+            reason = str(exc).lower()
+            parts = 4 if "content_filter" in reason or "refusal" in reason else 2
             items = self._call_by_regions(page, 0, 1000, parts)
 
         width, height = page.rect.width, page.rect.height
@@ -223,48 +230,56 @@ class GeminiOcr:
         delay = 5.0
         for attempt in range(1, _MAX_RETRIES + 1):
             try:
-                contents = [
-                    types.Part.from_bytes(data=png, mime_type="image/png"),
-                    self.prompt,
-                ]
+                prompt = self.prompt
                 if is_crop:
-                    contents.append(
+                    prompt += (
+                        "\n\n"
                         "La imagen es un recorte horizontal de una página. "
                         "Procesa únicamente el texto visible, sin reconstruir "
                         "contenido fuera del recorte. Normaliza box_2d y "
                         "cell_box_2d de 0 a 1000 respecto de ESTE RECORTE."
                     )
-                response = self.client.models.generate_content(
+                image = base64.b64encode(png).decode("ascii")
+                response = self.client.responses.parse(
                     model=self.model,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=list[OcrBlock],
-                        temperature=0.1,
-                        thinking_config=(
-                            types.ThinkingConfig(thinking_level="low")
-                            if self.model.startswith("gemini-3")
-                            else None
-                        ),
-                    ),
+                    input=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": prompt},
+                                {
+                                    "type": "input_image",
+                                    "image_url": f"data:image/png;base64,{image}",
+                                    "detail": "high",
+                                },
+                            ],
+                        }
+                    ],
+                    text_format=OcrPage,
+                    store=False,
                 )
-                parsed = response.parsed
+                parsed = response.output_parsed
                 if parsed is None:
                     detail = _describe_empty_response(response)
-                    if response.text is None:
+                    text = getattr(response, "output_text", None)
+                    if not text:
                         raise EmptyOcrResponse(detail)
                     raise ValueError(
                         f"Respuesta sin JSON parseable ({detail}): "
-                        f"{response.text!r:.200}"
+                        f"{text!r:.200}"
                     )
-                return parsed
+                return parsed.blocks
             except EmptyOcrResponse:
                 # Repetir la misma imagen no corrige bloqueos ni respuestas
                 # vacías deterministas; el caller la divide en regiones.
                 raise
-            except (errors.APIError, ValueError) as exc:
-                code = getattr(exc, "code", None)
-                retryable = code in _RETRYABLE_CODES or isinstance(exc, ValueError)
+            except (OpenAIError, ValueError) as exc:
+                code = getattr(exc, "status_code", None)
+                retryable = (
+                    isinstance(exc, ValueError)
+                    or code is None
+                    or code in _RETRYABLE_CODES
+                )
                 if retryable and attempt < _MAX_RETRIES:
                     print(
                         f"    OCR error ({exc.__class__.__name__}); "
@@ -325,31 +340,31 @@ def _box_to_page(
 
 def _describe_empty_response(response) -> str:
     """Resume el motivo real de una respuesta vacía sin volcar datos sensibles."""
-    candidate = response.candidates[0] if response.candidates else None
-    reason = getattr(candidate, "finish_reason", None)
-    if hasattr(reason, "value"):
-        reason = reason.value
-    message = getattr(candidate, "finish_message", None)
+    status = getattr(response, "status", None)
+    incomplete = getattr(response, "incomplete_details", None)
+    reason = getattr(incomplete, "reason", None)
+    error = getattr(response, "error", None)
+    error_code = getattr(error, "code", None)
+    error_message = getattr(error, "message", None)
 
-    feedback = response.prompt_feedback
-    block_reason = getattr(feedback, "block_reason", None)
-    if hasattr(block_reason, "value"):
-        block_reason = block_reason.value
-    block_message = getattr(feedback, "block_reason_message", None)
+    refusals = []
+    for item in getattr(response, "output", None) or []:
+        for content in getattr(item, "content", None) or []:
+            if getattr(content, "type", None) == "refusal":
+                refusals.append(getattr(content, "refusal", None))
 
-    usage = response.usage_metadata
+    usage = getattr(response, "usage", None)
     tokens = ""
     if usage is not None:
         tokens = (
             ", tokens="
-            f"prompt:{getattr(usage, 'prompt_token_count', None)}/"
-            f"respuesta:{getattr(usage, 'candidates_token_count', None)}/"
-            f"pensamiento:{getattr(usage, 'thoughts_token_count', None)}/"
-            f"total:{getattr(usage, 'total_token_count', None)}"
+            f"entrada:{getattr(usage, 'input_tokens', None)}/"
+            f"salida:{getattr(usage, 'output_tokens', None)}/"
+            f"total:{getattr(usage, 'total_tokens', None)}"
         )
     return (
-        f"finish_reason={reason!r}, finish_message={message!r}, "
-        f"block_reason={block_reason!r}, block_message={block_message!r}"
+        f"status={status!r}, reason={reason!r}, error_code={error_code!r}, "
+        f"error_message={error_message!r}, refusals={refusals!r}"
         f"{tokens}"
     )
 

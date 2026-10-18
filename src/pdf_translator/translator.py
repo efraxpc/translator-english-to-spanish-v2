@@ -1,12 +1,12 @@
-"""Cliente Gemini: traduce bloques en lotes con structured output y retries."""
+"""Cliente OpenAI: traduce bloques en lotes con salida estructurada y reintentos."""
 
 import json
 import time
 
-from google import genai
-from google.genai import errors, types
+from openai import OpenAI, OpenAIError
 from pydantic import BaseModel
 
+from .config import get_openai_api_key
 from .extractor import Block
 
 _MAX_RETRIES = 5
@@ -16,6 +16,10 @@ _RETRYABLE_CODES = {429, 500, 502, 503, 504}
 class TranslatedBlock(BaseModel):
     id: str
     translated: str
+
+
+class TranslationBatch(BaseModel):
+    translations: list[TranslatedBlock]
 
 
 class StitchedFragments(BaseModel):
@@ -96,14 +100,16 @@ def build_system_prompt(glossary: list[str], parafrasear: bool = False) -> str:
     )
 
 
-class GeminiTranslator:
+class OpenAITranslator:
     def __init__(
         self,
         model: str,
         glossary: list[str] | None = None,
         parafrasear: bool = False,
     ):
-        self.client = genai.Client()
+        # Los reintentos se gestionan aquí para mantener un único backoff
+        # predecible y mensajes claros en el CLI.
+        self.client = OpenAI(api_key=get_openai_api_key(), max_retries=0)
         self.model = model
         self.glossary = glossary or []
         self.parafrasear = parafrasear
@@ -141,24 +147,23 @@ class GeminiTranslator:
         delay = 5.0
         for attempt in range(1, _MAX_RETRIES + 1):
             try:
-                response = self.client.models.generate_content(
+                response = self.client.responses.parse(
                     model=self.model,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=_STITCH_SYSTEM_PROMPT,
-                        response_mime_type="application/json",
-                        response_schema=StitchedFragments,
-                        temperature=0.2,
-                    ),
+                    instructions=_STITCH_SYSTEM_PROMPT,
+                    input=contents,
+                    text_format=StitchedFragments,
+                    store=False,
                 )
-                parsed = response.parsed
+                parsed = response.output_parsed
                 if parsed is None:
-                    raise ValueError(f"Respuesta sin JSON parseable: {response.text!r:.200}")
+                    text = getattr(response, "output_text", None)
+                    raise ValueError(f"Respuesta sin JSON parseable: {text!r:.200}")
                 return parsed.tail, parsed.head
-            except errors.APIError as exc:
-                if exc.code in _RETRYABLE_CODES and attempt < _MAX_RETRIES:
+            except OpenAIError as exc:
+                code = getattr(exc, "status_code", None)
+                if _is_retryable(exc) and attempt < _MAX_RETRIES:
                     print(
-                        f"    API error {exc.code} ({exc.status}); "
+                        f"    Error de API {code or exc.__class__.__name__}; "
                         f"reintento {attempt}/{_MAX_RETRIES} en {delay:.0f}s..."
                     )
                     time.sleep(delay)
@@ -171,24 +176,23 @@ class GeminiTranslator:
         delay = 5.0
         for attempt in range(1, _MAX_RETRIES + 1):
             try:
-                response = self.client.models.generate_content(
+                response = self.client.responses.parse(
                     model=self.model,
-                    contents=payload,
-                    config=types.GenerateContentConfig(
-                        system_instruction=self.system_prompt,
-                        response_mime_type="application/json",
-                        response_schema=list[TranslatedBlock],
-                        temperature=0.1,
-                    ),
+                    instructions=self.system_prompt,
+                    input=payload,
+                    text_format=TranslationBatch,
+                    store=False,
                 )
-                parsed = response.parsed
+                parsed = response.output_parsed
                 if parsed is None:
-                    raise ValueError(f"Respuesta sin JSON parseable: {response.text!r:.200}")
-                return parsed
-            except errors.APIError as exc:
-                if exc.code in _RETRYABLE_CODES and attempt < _MAX_RETRIES:
+                    text = getattr(response, "output_text", None)
+                    raise ValueError(f"Respuesta sin JSON parseable: {text!r:.200}")
+                return parsed.translations
+            except OpenAIError as exc:
+                code = getattr(exc, "status_code", None)
+                if _is_retryable(exc) and attempt < _MAX_RETRIES:
                     print(
-                        f"    API error {exc.code} ({exc.status}); "
+                        f"    Error de API {code or exc.__class__.__name__}; "
                         f"reintento {attempt}/{_MAX_RETRIES} en {delay:.0f}s..."
                     )
                     time.sleep(delay)
@@ -196,3 +200,10 @@ class GeminiTranslator:
                     continue
                 raise
         raise RuntimeError("unreachable")
+
+
+def _is_retryable(exc: OpenAIError) -> bool:
+    """Indica si un error de OpenAI merece otro intento."""
+    code = getattr(exc, "status_code", None)
+    # Los errores de conexión y timeout no tienen código HTTP.
+    return code is None or code in _RETRYABLE_CODES

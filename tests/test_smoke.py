@@ -17,10 +17,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from pdf_translator import __main__ as cli  # noqa: E402
 from pdf_translator.checkpoint import Checkpoint  # noqa: E402
+from pdf_translator.config import MissingApiKeyError, get_openai_api_key  # noqa: E402
 from pdf_translator.extractor import Block, extract_blocks  # noqa: E402
 from pdf_translator.ocr import (  # noqa: E402
-    GeminiOcr,
+    OpenAIOcr,
     OcrBlock,
+    OcrPage,
     _remap_region_items,
     block_from_dict,
     block_to_dict,
@@ -28,8 +30,10 @@ from pdf_translator.ocr import (  # noqa: E402
 )
 from pdf_translator.rebuilder import rebuild  # noqa: E402
 from pdf_translator.translator import (  # noqa: E402
-    GeminiTranslator,
+    OpenAITranslator,
+    StitchedFragments,
     TranslatedBlock,
+    TranslationBatch,
     build_system_prompt,
 )
 
@@ -224,7 +228,7 @@ def test_table_structure_is_preserved():
 def test_table_metadata_reaches_translation_prompt():
     """El traductor identifica celdas sin cambiar su esquema de respuesta."""
     captured = {}
-    translator = GeminiTranslator.__new__(GeminiTranslator)
+    translator = OpenAITranslator.__new__(OpenAITranslator)
 
     def fake_call(payload):
         captured.update(json.loads(payload)[0])
@@ -250,6 +254,69 @@ def test_table_metadata_reaches_translation_prompt():
     assert "Modo parafraseo" in prompt
 
     print("OK: metadatos de tabla enviados sin anular el parafraseo")
+
+
+def test_openai_responses_contract():
+    """Traducción y costura usan Responses con salida estructurada y sin guardar."""
+
+    class FakeResponses:
+        def __init__(self):
+            self.calls = []
+
+        def parse(self, **kwargs):
+            self.calls.append(kwargs)
+            if kwargs["text_format"] is TranslationBatch:
+                parsed = TranslationBatch(
+                    translations=[
+                        TranslatedBlock(id="b1", translated="Texto traducido")
+                    ]
+                )
+            else:
+                assert kwargs["text_format"] is StitchedFragments
+                parsed = StitchedFragments(
+                    tail="Primera parte", head="y segunda parte."
+                )
+            return SimpleNamespace(output_parsed=parsed, output_text="{}")
+
+    responses = FakeResponses()
+    translator = OpenAITranslator.__new__(OpenAITranslator)
+    translator.client = SimpleNamespace(responses=responses)
+    translator.model = "gpt-5.6-terra"
+    translator.system_prompt = "Instrucciones de prueba"
+
+    result = translator.translate_batch(
+        [Block(id="b1", page=0, bbox=(0, 0, 100, 20), text="Text")]
+    )
+    stitched = translator.stitch_pair("Primera", "segunda")
+
+    assert result == {"b1": "Texto traducido"}
+    assert stitched == ("Primera parte", "y segunda parte.")
+    assert all(call["store"] is False for call in responses.calls)
+    assert all("temperature" not in call for call in responses.calls)
+    assert responses.calls[0]["text_format"] is TranslationBatch
+    assert responses.calls[0]["instructions"] == "Instrucciones de prueba"
+    assert json.loads(responses.calls[0]["input"])[0]["id"] == "b1"
+    assert responses.calls[1]["text_format"] is StitchedFragments
+
+    print("OK: contrato de Responses API para traducción y costura")
+
+
+def test_openai_api_key_configuration():
+    """Acepta el nombre oficial, migra el antiguo y explica si falta la clave."""
+    assert get_openai_api_key({"OPENAI_API_KEY": "oficial"}) == "oficial"
+    assert get_openai_api_key({"OPEN_AI_API_KEY": "antigua"}) == "antigua"
+    assert get_openai_api_key(
+        {"OPENAI_API_KEY": "", "OPEN_AI_API_KEY": "antigua"}
+    ) == "antigua"
+
+    try:
+        get_openai_api_key({})
+    except MissingApiKeyError as exc:
+        assert "OPENAI_API_KEY" in str(exc)
+    else:
+        raise AssertionError("aceptó una configuración sin API key")
+
+    print("OK: configuración y compatibilidad de OPENAI_API_KEY")
 
 
 def test_seam_detection():
@@ -313,42 +380,41 @@ def test_seam_detection():
 def test_ocr_empty_response_uses_regions():
     """Una respuesta vacía se subdivide sin repetir la misma llamada."""
 
-    class FakeModels:
+    class FakeResponses:
         def __init__(self):
             self.calls = []
 
-        def generate_content(self, **kwargs):
+        def parse(self, **kwargs):
             self.calls.append(kwargs)
             if len(self.calls) == 1:
                 return SimpleNamespace(
-                    parsed=None,
-                    text=None,
-                    candidates=[
-                        SimpleNamespace(
-                            finish_reason="RECITATION",
-                            finish_message="respuesta detenida",
-                        )
-                    ],
-                    prompt_feedback=None,
-                    usage_metadata=None,
+                    output_parsed=None,
+                    output_text="",
+                    status="incomplete",
+                    incomplete_details=SimpleNamespace(reason="content_filter"),
+                    error=None,
+                    output=[],
+                    usage=None,
                 )
-            parsed = [
-                OcrBlock(
-                    box_2d=[100, 100, 200, 900],
-                    text=f"Franja {len(self.calls) - 1}",
-                    is_code=False,
-                    line_count=1,
-                    bold=False,
-                )
-            ]
-            return SimpleNamespace(parsed=parsed, text="[]")
+            parsed = OcrPage(
+                blocks=[
+                    OcrBlock(
+                        box_2d=[100, 100, 200, 900],
+                        text=f"Franja {len(self.calls) - 1}",
+                        is_code=False,
+                        line_count=1,
+                        bold=False,
+                    )
+                ]
+            )
+            return SimpleNamespace(output_parsed=parsed, output_text="{}")
 
-    models = FakeModels()
-    client = SimpleNamespace(models=models)
+    responses = FakeResponses()
+    client = SimpleNamespace(responses=responses)
     doc = pymupdf.open()
     page = doc.new_page()
 
-    blocks = GeminiOcr(client, "gemini-3.1-pro-preview").ocr_page(page, 0)
+    blocks = OpenAIOcr(client, "gpt-5.6-terra").ocr_page(page, 0)
     page_height = page.rect.height
 
     doc.close()
@@ -364,12 +430,17 @@ def test_ocr_empty_response_uses_regions():
         525,
         775,
     ], "remapeó mal las coordenadas verticales de los recortes"
-    assert len(models.calls) == 5, "repitió la página completa en vez de recortarla"
-    full_image = models.calls[0]["contents"][0].inline_data.data
-    cropped_image = models.calls[1]["contents"][0].inline_data.data
+    assert len(responses.calls) == 5, "repitió la página completa en vez de recortarla"
+    full_content = responses.calls[0]["input"][0]["content"]
+    cropped_content = responses.calls[1]["input"][0]["content"]
+    full_image = next(part for part in full_content if part["type"] == "input_image")
+    cropped_image = next(
+        part for part in cropped_content if part["type"] == "input_image"
+    )
     assert full_image != cropped_image, "el fallback siguió enviando la página completa"
-    config = models.calls[0]["config"]
-    assert config.thinking_config.thinking_level.value == "LOW"
+    assert responses.calls[0]["text_format"] is OcrPage
+    assert responses.calls[0]["store"] is False
+    assert "temperature" not in responses.calls[0]
 
     print("OK: fallback OCR por regiones ante respuesta vacía")
 
@@ -377,28 +448,30 @@ def test_ocr_empty_response_uses_regions():
 def test_ocr_table_cell_boxes_and_cache_roundtrip():
     """OCR separa el texto que se cubre del espacio disponible en la celda."""
 
-    class FakeModels:
+    class FakeResponses:
         @staticmethod
-        def generate_content(**_kwargs):
+        def parse(**_kwargs):
             return SimpleNamespace(
-                parsed=[
-                    OcrBlock(
-                        box_2d=[120, 120, 180, 400],
-                        cell_box_2d=[100, 100, 200, 500],
-                        text="Encabezado traducido",
-                        is_code=False,
-                        line_count=1,
-                        bold=True,
-                        is_table_cell=True,
-                    )
-                ],
-                text="[]",
+                output_parsed=OcrPage(
+                    blocks=[
+                        OcrBlock(
+                            box_2d=[120, 120, 180, 400],
+                            cell_box_2d=[100, 100, 200, 500],
+                            text="Encabezado traducido",
+                            is_code=False,
+                            line_count=1,
+                            bold=True,
+                            is_table_cell=True,
+                        )
+                    ]
+                ),
+                output_text="{}",
             )
 
     doc = pymupdf.open()
     page = doc.new_page()
-    block = GeminiOcr(
-        SimpleNamespace(models=FakeModels()), "gemini-3.1-pro-preview"
+    block = OpenAIOcr(
+        SimpleNamespace(responses=FakeResponses()), "gpt-5.6-terra"
     ).ocr_page(page, 0)[0]
     assert block.is_table_cell
     assert block.layout_bbox is not None
@@ -505,6 +578,7 @@ def test_partial_translation_keeps_only_selected_pages():
             "envió a traducir bloques fuera del rango solicitado"
         )
         result = pymupdf.open(out)
+        assert all(page.rect == pymupdf.Rect(0, 0, 595, 842) for page in result)
         texts = [page.get_text() for page in result]
         result.close()
         assert len(texts) == 2
@@ -524,6 +598,7 @@ def test_partial_translation_keeps_only_selected_pages():
         )
         full_result = pymupdf.open(full_out)
         assert len(full_result) == 4
+        assert all(page.rect == pymupdf.Rect(0, 0, 595, 842) for page in full_result)
         full_result.close()
         assert full_translator.calls == [[0, 1, 2, 3]]
 
@@ -531,21 +606,21 @@ def test_partial_translation_keeps_only_selected_pages():
 
 
 def test_page_range_cli_clamps_and_rejects_outside_start():
-    """El CLI ajusta el final, nombra la salida y falla antes de usar Gemini."""
+    """El CLI ajusta el final, nombra la salida y falla antes de usar OpenAI."""
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         src = tmp_path / "manual.pdf"
         make_multipage_pdf(src)
 
         fake = FakeTranslator()
-        original_translator = cli.GeminiTranslator
+        original_translator = cli.OpenAITranslator
         original_argv = sys.argv[:]
         try:
-            cli.GeminiTranslator = lambda **_kwargs: fake
+            cli.OpenAITranslator = lambda **_kwargs: fake
             sys.argv = ["pdf-translator", str(src), "--pages", "3-99"]
             cli.main()
         finally:
-            cli.GeminiTranslator = original_translator
+            cli.OpenAITranslator = original_translator
             sys.argv = original_argv
 
         clamped_out = tmp_path / "manual.p3-4.es.pdf"
@@ -579,10 +654,144 @@ def test_page_range_cli_clamps_and_rejects_outside_start():
     print("OK: ajuste y rechazo de rangos en el CLI")
 
 
+def test_paragraph_width_preserves_page_size():
+    """Centra el texto normal y OCR con ancho limitado sin escalar páginas."""
+    for from_ocr in (False, True):
+        for width in (200, 500):
+            with pymupdf.open() as doc:
+                page = doc.new_page(width=595, height=842)
+                bbox = (40, 40, 40 + width, 220)
+                if not from_ocr:
+                    page.insert_textbox(bbox, "Original en inglés " * 15)
+                page.insert_text((40, 300), "def ejemplo(): pass")
+                translated = "Este párrafo explica el funcionamiento del sistema. " * 12
+                block = Block(
+                    id="p0_b0", page=0, bbox=bbox, text="Original en inglés",
+                    translated=translated, from_ocr=from_ocr,
+                )
+                rebuild(doc, [block])
+                with pymupdf.open(stream=doc.tobytes(), filetype="pdf") as result:
+                    output = result[0]
+                    assert output.rect == pymupdf.Rect(0, 0, 595, 842)
+                    paragraph_area = pymupdf.Rect(0, 40, 595, 220)
+                    text = output.get_text(clip=paragraph_area)
+                    assert " ".join(text.split()) == " ".join(translated.split())
+                    assert "def ejemplo(): pass" in output.get_text()
+                    words = output.get_text("words", clip=paragraph_area)
+                    expected_width = min(width, 13 * 72 / 2.54)
+                    expected_left = (595 - expected_width) / 2
+                    # insert_htmlbox deja un margen interno mínimo.
+                    assert abs(min(word[0] for word in words) - expected_left) < 2
+                    assert max(word[2] for word in words) <= expected_left + expected_width + 0.001
+    print("OK: párrafos centrados de hasta 13 cm con tamaño de página intacto")
+
+
+def test_structured_layout_is_not_centered_or_narrowed():
+    """Tablas anchas y columnas sin bordes conservan sus cajas, también en OCR."""
+    from unittest.mock import patch
+    from pdf_translator.rebuilder import _block_html
+
+    for from_ocr in (False, True):
+        with pymupdf.open() as doc:
+            page = doc.new_page()
+            blocks = [
+                Block(id="tabla", page=0, bbox=(30, 40, 550, 85),
+                      layout_bbox=(25, 35, 555, 90), text="Celda ancha",
+                      translated="Celda ancha", is_table_cell=True, from_ocr=from_ocr),
+                Block(id="izquierda", page=0, bbox=(30, 120, 160, 150),
+                      text="Concepto", translated="Concepto", from_ocr=from_ocr),
+                Block(id="derecha", page=0, bbox=(330, 120, 550, 150),
+                      text="Explicación", translated="Explicación", from_ocr=from_ocr),
+                Block(id="filas", page=0, bbox=(30, 190, 550, 260),
+                      text="Nombre    Valor\nPrimero    Segundo",
+                      translated="Nombre    Valor\nPrimero    Segundo", from_ocr=from_ocr),
+            ]
+            original_insert = pymupdf.Page.insert_htmlbox
+            inserted = []
+
+            def record_insert(target, rect, *args, **kwargs):
+                inserted.append(tuple(rect))
+                return original_insert(target, rect, *args, **kwargs)
+
+            with patch.object(pymupdf.Page, "insert_htmlbox", record_insert):
+                rebuild(doc, blocks)
+            assert inserted == [b.layout_bbox or b.bbox for b in blocks]
+            assert "white-space: pre-wrap" in _block_html(blocks[-1], True)
+            assert "Nombre    Valor\nPrimero    Segundo" in _block_html(blocks[-1], True)
+            assert "Explicación" in doc[0].get_text()
+
+    # PyMuPDF puede agrupar varias columnas en un único bloque de texto.
+    with pymupdf.open() as doc:
+        page = doc.new_page()
+        for y in (50, 80, 110):
+            page.insert_text((30, y), "Concepto")
+            page.insert_text((330, y), "Valor")
+        from pdf_translator.rebuilder import _structured_blocks
+        blocks = extract_blocks(doc)
+        assert blocks
+        assert _structured_blocks(page, blocks) == {b.id for b in blocks}
+    print("OK: tablas y estructuras sin bordes mantienen ancho y posición")
+
+
+def test_headings_do_not_overlap():
+    """Encabezados cercanos y cajas OCR solapadas mantienen texto legible."""
+    from pdf_translator.rebuilder import _layout_rects
+
+    with pymupdf.open() as doc:
+        page = doc.new_page()
+        blocks = [
+            Block(id="titulo", page=0, bbox=(40, 40, 180, 70),
+                  text="Título", translated="Título principal", bold=True, font_size=18),
+            Block(id="subtitulo", page=0, bbox=(184, 40, 350, 70),
+                  text="Subtítulo", translated="Subtítulo cercano", bold=True, font_size=14),
+            Block(id="ocr_titulo", page=0, bbox=(40, 110, 500, 142),
+                  text="Encabezado OCR", translated="Encabezado OCR",
+                  bold=True, font_size=18, from_ocr=True),
+            Block(id="parrafo", page=0, bbox=(40, 136, 540, 250),
+                  text="Este párrafo explica el contenido del documento. " * 8,
+                  translated="Este párrafo explica el contenido del documento. " * 8,
+                  from_ocr=True),
+        ]
+        rects = _layout_rects(page, blocks, set())
+        assert rects["titulo"] == pymupdf.Rect(blocks[0].bbox)
+        assert rects["subtitulo"] == pymupdf.Rect(blocks[1].bbox)
+        assert not rects["ocr_titulo"].intersects(rects["parrafo"])
+        rebuild(doc, blocks)
+        with pymupdf.open(stream=doc.tobytes(), filetype="pdf") as result:
+            output = result[0]
+            text = " ".join(output.get_text().split())
+            for block in blocks:
+                assert " ".join(block.translated.split()) in text
+            words = output.get_text("words")
+            for index, word in enumerate(words):
+                for other in words[index + 1:]:
+                    if word[5] == other[5]:
+                        continue  # las cajas tipográficas de líneas contiguas se cruzan
+                    overlap = pymupdf.Rect(word[:4]) & pymupdf.Rect(other[:4])
+                    assert overlap.is_empty, (word[4], other[4])
+
+    # El centrado no puede invadir texto que queda en su posición original.
+    with pymupdf.open() as doc:
+        page = doc.new_page()
+        paragraph = Block(id="p", page=0, bbox=(30, 40, 200, 170),
+                          text="Contenido del párrafo. " * 10,
+                          translated="Contenido del párrafo. " * 10)
+        fixed = Block(id="fijo", page=0, bbox=(205, 45, 240, 60),
+                      text="123", translatable=False)
+        rects = _layout_rects(page, [paragraph, fixed], set())
+        assert rects["p"].x0 == paragraph.bbox[0]
+    print("OK: títulos y subtítulos sin solapamientos al reconstruir")
+
+
 if __name__ == "__main__":
+    test_headings_do_not_overlap()
+    test_structured_layout_is_not_centered_or_narrowed()
+    test_paragraph_width_preserves_page_size()
     test_pipeline_preserves_code()
     test_table_structure_is_preserved()
     test_table_metadata_reaches_translation_prompt()
+    test_openai_responses_contract()
+    test_openai_api_key_configuration()
     test_seam_detection()
     test_ocr_empty_response_uses_regions()
     test_ocr_table_cell_boxes_and_cache_roundtrip()
